@@ -8,28 +8,19 @@ Users ask natural-language questions in Teams, Copilot Studio routes them to the
 
 ## Architecture
 
-```
-Teams / Copilot Studio User
-    │
-    ▼
-Copilot Studio Agent
-    │  MCP Streamable HTTP + Entra ID OAuth 2.0 Bearer token
-    ▼
-Azure Web App  (FastAPI + FastMCP)
-    │  Databricks Service Principal OAuth (client credentials)
-    ▼
-Databricks Genie Space
-    │
-    ▼
-Unity Catalog Tables
-```
+![Architecture](images/architecture.png)
 
-**Authentication chain (two hops):**
+### Authentication Flow
 
-| Hop | From | To | Method |
-|-----|------|----|--------|
-| 1 | Copilot Studio | MCP Server | Entra ID OAuth 2.0 — Copilot Studio obtains a Bearer token and sends it with each request; the MCP server validates it against Microsoft's JWKS |
-| 2 | MCP Server | Databricks | Service Principal client credentials — the Databricks SDK auto-discovers `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`, and `DATABRICKS_CLIENT_SECRET` from env vars |
+The system uses a two-hop authentication chain. Copilot Studio obtains an OAuth token from Entra ID and passes it as a Bearer token to the MCP server. The MCP server validates the JWT, then authenticates to Databricks using a separate Service Principal.
+
+![Authentication Flow](images/auth-flow.png)
+
+### Entra ID App Registrations
+
+Two Entra ID app registrations work together: the **Server App** (the API that the MCP server validates tokens against) and the **Client App** (the credentials that Copilot Studio uses to obtain tokens).
+
+![Entra ID App Registrations](images/entra-apps.png)
 
 ---
 
