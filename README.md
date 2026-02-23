@@ -1,5 +1,7 @@
 # Genie MCP Server for Copilot Studio & Teams
 
+[![GitHub](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/sean-zhang-dbx/genie-mcp-copilot)
+
 An MCP (Model Context Protocol) server that connects **Databricks Genie** to **Microsoft Copilot Studio** and **Microsoft Teams**. Deployed on **Azure Web Apps** with optional **Entra ID OAuth 2.0** authentication.
 
 Users ask natural-language questions in Teams, Copilot Studio routes them to the MCP server, which forwards them to a Databricks Genie Space and returns the answer.
