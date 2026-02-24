@@ -100,9 +100,9 @@ def get_summary_report(
 
 The MCP server authenticates to Databricks using a Service Principal (SP). You can create one via the Databricks CLI, the workspace admin UI, or the account console.
 
-> **Note:** Creating Service Principals requires **workspace admin** privileges. If you don't have admin access, ask your Databricks workspace admin to create the SP for you, or use the account console (Option C).
+> **Note:** Creating Service Principals requires **workspace admin** or **account admin** privileges — this applies to all three options below (CLI, UI, and account console). If you don't have admin access, ask your Databricks admin to create the SP and share the Client ID and Secret with you.
 
-### Option A: Databricks CLI (recommended)
+### Option A: Databricks CLI
 
 ```bash
 # Authenticate the CLI to your workspace
