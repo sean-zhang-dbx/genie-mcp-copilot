@@ -98,9 +98,11 @@ def get_summary_report(
 
 ## Step 1 — Create a Databricks Service Principal
 
-The MCP server authenticates to Databricks using a Service Principal (SP). You can create one via the Databricks CLI or the workspace UI.
+The MCP server authenticates to Databricks using a Service Principal (SP). You can create one via the Databricks CLI, the workspace admin UI, or the account console.
 
-### Option A: Databricks CLI
+> **Note:** Creating Service Principals requires **workspace admin** privileges. If you don't have admin access, ask your Databricks workspace admin to create the SP for you, or use the account console (Option C).
+
+### Option A: Databricks CLI (recommended)
 
 ```bash
 # Authenticate the CLI to your workspace
@@ -122,20 +124,44 @@ databricks service-principals secrets create \
 
 Save the `secret` value — this is your `DATABRICKS_CLIENT_SECRET`. It is shown only once.
 
-### Option B: Workspace UI
+### Option B: Workspace Admin UI
 
-1. Go to **Settings > Identity and access > Service principals**
-2. Click **Add service principal > Add new**
-3. Enter a display name, click **Add**
-4. Click into the SP, go to **Secrets > Generate secret**
-5. Copy the **Client ID** and **Secret**
+> The **Identity and access** menu is only visible to workspace admins. If you only see User settings (Profile, Preferences, Developer, etc.), you do not have admin access — use Option A or Option C instead.
+
+1. In the Databricks workspace, click your **username** in the top-right corner
+2. Click **Settings**
+3. In the left sidebar, scroll down to the **Admin** section and click **Identity and access**
+4. Click **Service principals > Manage**
+5. Click **Add service principal > Add new**
+6. Enter a display name, click **Add**
+7. Click into the SP, go to **Secrets > Generate secret**
+8. Copy the **Client ID** and **Secret**
+
+### Option C: Account Console
+
+If you have access to the Databricks account console (account admin):
+
+1. Go to `https://accounts.azuredatabricks.net`
+2. Click **User management > Service principals**
+3. Click **Add service principal**
+4. Enter a name, click **Add**
+5. Click into the SP, go to **Generate secret**
+6. Copy the **Client ID** and **Secret**
+7. Assign the SP to the target workspace under **Workspaces** tab
 
 ### Grant the SP access to the Genie Space
 
 1. Open the Genie Space in the Databricks workspace
 2. Click the **Share** button (or go to Genie Space settings)
 3. Add the Service Principal with **Can Run** permission
-4. Also ensure the SP has `USE CATALOG` and `SELECT` on the underlying tables
+4. Also ensure the SP has `USE CATALOG` and `SELECT` on the underlying tables (ask your workspace admin to run the following SQL if needed):
+
+```sql
+-- Replace with your catalog/schema names and SP name
+GRANT USE CATALOG ON CATALOG your_catalog TO `your-service-principal-name`;
+GRANT USE SCHEMA ON SCHEMA your_catalog.your_schema TO `your-service-principal-name`;
+GRANT SELECT ON SCHEMA your_catalog.your_schema TO `your-service-principal-name`;
+```
 
 ---
 
