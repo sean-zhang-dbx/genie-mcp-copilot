@@ -1,6 +1,6 @@
-# Azure Web App / Databricks App configuration
-# For Azure: these env vars are set via App Settings (portal or CLI), not this file
-# For Databricks Apps: this file is used directly by the runtime
+# Databricks Apps configuration
+# Databricks auto-injects DATABRICKS_HOST, DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET
+# so they are not listed here.
 
 command:
   - "uvicorn"
@@ -8,32 +8,28 @@ command:
   - "--host"
   - "0.0.0.0"
   - "--port"
-  - "8000"
+  - "8080"
 
 env:
-  # Databricks workspace URL (e.g. https://adb-xxxx.xx.azuredatabricks.net)
-  - name: DATABRICKS_HOST
-    value: ""
-
-  # Databricks Service Principal credentials
-  - name: DATABRICKS_CLIENT_ID
-    value: ""
-  - name: DATABRICKS_CLIENT_SECRET
-    value: ""
-
-  # Genie Space ID (from the Genie Space URL)
+  # Genie Space ID — resolved from the managed resource below
   - name: GENIE_SPACE_ID
-    value: ""
+    valueFrom:
+      resource: genie-space
 
-  # Microsoft Entra ID auth (leave blank to disable -- useful for local dev)
+  # Microsoft Entra ID auth (optional — only needed for Copilot Studio integration)
   - name: AZURE_TENANT_ID
     value: ""
   - name: AZURE_CLIENT_ID
     value: ""
 
-  # MLflow tracking URI (required when databricks-ai-bridge is installed)
+  # MLflow tracking URI (required by databricks-ai-bridge)
   - name: MLFLOW_TRACKING_URI
     value: "databricks"
 
   - name: LOG_LEVEL
     value: "INFO"
+
+resources:
+  - name: genie-space
+    genie_space:
+      permission: CAN_RUN
