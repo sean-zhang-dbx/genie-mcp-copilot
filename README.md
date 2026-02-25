@@ -1,21 +1,25 @@
-# Genie MCP Server for Copilot Studio & Teams (Databricks Apps)
+# Genie MCP Server (Databricks Apps)
 
 [![GitHub](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/sean-zhang-dbx/genie-mcp-copilot)
 
-> **This is the Databricks Apps branch.** For the Azure Web Apps version, see the [`main`](https://github.com/sean-zhang-dbx/genie-mcp-copilot/tree/main) branch.
+> **This is the Databricks Apps branch.** For the Azure Web Apps version (required for Copilot Studio / Teams integration), see the [`main`](https://github.com/sean-zhang-dbx/genie-mcp-copilot/tree/main) branch.
 
-An MCP (Model Context Protocol) server that connects **Databricks Genie** to **Microsoft Copilot Studio** and **Microsoft Teams**. Deployed as a **Databricks App** with optional **Entra ID OAuth 2.0** authentication.
+An MCP (Model Context Protocol) server that connects **Databricks Genie** to any MCP-compatible client. Deployed as a **Databricks App** with Databricks-native authentication.
 
-Users ask natural-language questions in Teams, Copilot Studio routes them to the MCP server, which forwards them to a Databricks Genie Space and returns the answer.
+Users or MCP clients send natural-language questions to the server, which forwards them to a Databricks Genie Space and returns the answer.
+
+> **Important: Databricks Apps vs Azure Web Apps**
+>
+> Databricks Apps are behind Databricks' own session authentication. This means **only clients that can authenticate to Databricks** (e.g. users in a browser, Claude Desktop with Databricks auth, Cursor) can reach this endpoint. **External services like Copilot Studio cannot directly call Databricks Apps** because they cannot complete Databricks' OAuth login flow.
+>
+> - **For Copilot Studio / Teams**: Use the [`main` branch](https://github.com/sean-zhang-dbx/genie-mcp-copilot/tree/main) (Azure Web Apps deployment)
+> - **For MCP clients with Databricks auth**: Use this branch (Databricks Apps deployment)
 
 ## Architecture
 
 ```
-Teams / Copilot Studio User
-    |
-    v
-Copilot Studio Agent
-    |  MCP Streamable HTTP + Entra ID OAuth 2.0 Bearer token
+MCP Client (Claude Desktop, Cursor, browser, etc.)
+    |  Databricks session auth (browser) or Databricks OAuth
     v
 Databricks App  (FastAPI + FastMCP)
     |  Auto-injected Service Principal credentials
@@ -26,12 +30,7 @@ Databricks Genie Space
 Unity Catalog Tables
 ```
 
-**Authentication chain (two hops):**
-
-| Hop | From | To | Method |
-|-----|------|----|--------|
-| 1 | Copilot Studio | MCP Server | Entra ID OAuth 2.0 -- Copilot Studio obtains a Bearer token and sends it with each request; the MCP server validates it against Microsoft's JWKS |
-| 2 | MCP Server | Databricks | Auto-injected Service Principal -- Databricks Apps automatically provisions an SP and injects `DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET` into the app environment |
+**Authentication:** Databricks Apps automatically provisions a Service Principal for each app and injects `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`, and `DATABRICKS_CLIENT_SECRET` into the environment. Users authenticate to the app via Databricks' own session management (browser login).
 
 ---
 
@@ -40,8 +39,6 @@ Unity Catalog Tables
 - **Databricks CLI** (`databricks`) -- [Install](https://docs.databricks.com/dev-tools/cli/install.html)
 - A **Databricks workspace** (Azure) with at least one Genie Space configured
 - **Workspace admin** access (to grant the app's Service Principal access to the Genie Space)
-- A **Microsoft Copilot Studio** license (for the agent)
-- An **Azure subscription** with permissions to create Entra ID App Registrations (for Copilot Studio OAuth)
 
 ---
 
@@ -192,199 +189,27 @@ The MCP endpoint is at: `https://YOUR-WORKSPACE.azuredatabricks.net/apps/YOUR-AP
 
 ---
 
-## Step 2 -- Create Entra ID App Registrations
+## Step 2 -- Using the MCP Server
 
-> This step is only required if you're connecting to **Copilot Studio**. If you're using the MCP server with a client that authenticates via Databricks directly, you can skip this.
-
-You need **two** app registrations: a **Server** app (the MCP API) and a **Client** app (Copilot Studio's connector).
-
-> **Single-tenant vs Multi-tenant:** If Copilot Studio runs in the **same** Entra ID tenant as the app registrations, use single-tenant. If they are in **different** tenants (common in enterprise environments), use multi-tenant. Instructions for both are provided below.
-
-### 2a. Server App Registration (MCP Server API)
-
-1. Go to **Azure Portal > Microsoft Entra ID > App registrations > New registration**
-2. Fill in:
-   - **Name**: A descriptive name (e.g. `Genie MCP Server`)
-   - **Supported account types**:
-     - **Single-tenant**: *Accounts in this organizational directory only* -- choose this if Copilot Studio is in the same tenant
-     - **Multi-tenant**: *Accounts in any organizational directory* -- choose this if Copilot Studio is in a different tenant
-3. Click **Register**
-4. Note these values from the **Overview** page:
-   - **Application (client) ID** -- this becomes your `AZURE_CLIENT_ID` env var
-   - **Directory (tenant) ID** -- this becomes your `AZURE_TENANT_ID` env var
-
-**Expose an API (create a permission scope):**
-
-5. Go to **Expose an API**
-6. Click **Set** next to Application ID URI -- accept the default `api://{client-id}` or enter a custom URI
-7. Click **Add a scope**:
-   | Field | Value |
-   |-------|-------|
-   | Scope name | `MCP.Tools.ReadWrite` |
-   | Who can consent | Admins and users |
-   | Admin consent display name | Read and write MCP tools |
-   | Admin consent description | Allows the application to call MCP tools on this server |
-   | State | Enabled |
-
-### 2b. Client App Registration (Copilot Studio Connector)
-
-1. Go to **App registrations > New registration**
-2. Fill in:
-   - **Name**: A descriptive name (e.g. `Genie Copilot Connector`)
-   - **Supported account types**: Same choice as the server app (single-tenant or multi-tenant)
-3. Click **Register**
-4. Note the **Application (client) ID**
-
-**Create a client secret:**
-
-5. Go to **Certificates & secrets > Client secrets > New client secret**
-6. Enter a description and expiry, click **Add**
-7. Copy the **Value** immediately (shown only once)
-
-**Add API permission:**
-
-8. Go to **API permissions > Add a permission > My APIs**
-9. Select the Server app (from step 2a)
-10. Select **Application permissions** (for client_credentials flow) -- check `MCP.Tools.ReadWrite`
-11. Click **Add permissions**
-12. Click **Grant admin consent for [your org]** (requires admin role)
-
-### 2c. Pre-authorize the Client App (recommended)
-
-1. Go back to the **Server App Registration > Expose an API**
-2. Under **Authorized client applications**, click **Add a client application**
-3. Enter the **Client App Registration's Application (client) ID**
-4. Check the `MCP.Tools.ReadWrite` scope
-5. Click **Add application**
-
-### 2d. Set the Entra ID env vars on the Databricks App
-
-After creating the app registrations, update the app's environment variables. Edit `app.yaml` and set:
-
-```yaml
-  - name: AZURE_TENANT_ID
-    value: "your-entra-tenant-id"
-  - name: AZURE_CLIENT_ID
-    value: "your-server-app-client-id"
-```
-
-Then redeploy:
-
-```bash
-databricks apps deploy YOUR-APP-NAME --source-code-path .
-```
-
-### Single-tenant vs Multi-tenant: code configuration
-
-The `app.py` code supports both modes. The difference is in the JWKS endpoint and issuer validation:
-
-| Setting | Single-tenant | Multi-tenant |
-|---------|---------------|--------------|
-| JWKS URI in `_get_jwks_uri()` | `https://login.microsoftonline.com/{AZURE_TENANT_ID}/discovery/v2.0/keys` | `https://login.microsoftonline.com/common/discovery/v2.0/keys` |
-| Issuer validation in `jwt.decode()` | `"verify_iss": True` | `"verify_iss": False` |
-| Copilot Studio OAuth URLs | Use `/{tenant-id}/` | Use `/common/` |
-
-**For single-tenant**, edit `_get_jwks_uri()` in `app.py`:
-
-```python
-def _get_jwks_uri() -> str:
-    return f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/discovery/v2.0/keys"
-```
-
-And set `"verify_iss": True` in the `jwt.decode()` options.
-
-**The default code is configured for multi-tenant** (uses `/common` and skips issuer validation).
-
----
-
-## Step 3 -- Connect to Copilot Studio
-
-### 3a. Create the MCP tool connection
-
-1. Go to [Copilot Studio](https://copilotstudio.microsoft.com)
-2. Open your agent (or create a new one)
-3. Go to **Tools > Add a tool > New tool > Model Context Protocol**
-4. Fill in:
-
-   | Field | Value |
-   |-------|-------|
-   | Server name | Your preferred display name |
-   | Server description | A description of what the tool does |
-   | Server URL | `https://YOUR-WORKSPACE.azuredatabricks.net/apps/YOUR-APP-NAME/mcp` |
-
-5. Under **Authentication**, select **OAuth 2.0**, then **Manual**
-6. Fill in the OAuth configuration:
-
-   | Field | Value |
-   |-------|-------|
-   | Client ID | Client App Registration's Application (client) ID |
-   | Client secret | Client App Registration's secret value |
-   | Authorization URL | See table below |
-   | Token URL | See table below |
-   | Refresh URL | See table below |
-   | Resource URL | `api://SERVER-APP-CLIENT-ID` |
-   | Scope | `api://SERVER-APP-CLIENT-ID/.default` |
-
-   **OAuth URLs by tenant mode:**
-
-   | URL | Single-tenant | Multi-tenant |
-   |-----|---------------|--------------|
-   | Authorization URL | `https://login.microsoftonline.com/YOUR-TENANT-ID/oauth2/v2.0/authorize` | `https://login.microsoftonline.com/common/oauth2/v2.0/authorize` |
-   | Token URL | `https://login.microsoftonline.com/YOUR-TENANT-ID/oauth2/v2.0/token` | `https://login.microsoftonline.com/common/oauth2/v2.0/token` |
-   | Refresh URL | `https://login.microsoftonline.com/YOUR-TENANT-ID/oauth2/v2.0/token` | `https://login.microsoftonline.com/common/oauth2/v2.0/token` |
-
-7. Click **Create**
-
-### 3b. Add the callback URL
-
-After creating the connection, Copilot Studio shows a **Callback URL** (redirect URI).
-
-1. Copy this URL
-2. Go to **Azure Portal > Client App Registration > Authentication**
-3. Under **Web > Redirect URIs**, click **Add URI**
-4. Paste the callback URL
-5. Click **Save**
-
-### 3c. Verify and add the tool
-
-1. Back in Copilot Studio, click **Next** on the tool configuration
-2. Verify the `query_genie` tool appears in the list
-3. Click **Add to agent**
-
----
-
-## Step 4 -- Configure the Agent
-
-### Agent instructions
-
-In Copilot Studio, go to the agent's **Instructions** section and add guidance. Tailor this to your data domain:
+Once deployed, the MCP endpoint is available at:
 
 ```
-You are a data analyst assistant. You help users explore and understand
-data through natural language.
-
-When users ask questions about the data, use the query_genie tool.
-
-Guidelines:
-- Be specific with dates and metric names when calling query_genie
-- Present results clearly, using tables when appropriate
-- If the Genie response includes SQL, you may show it to the user if they ask
-- For follow-up questions, pass the conversation_id from the previous
-  response to maintain context in the Genie conversation
+https://YOUR-APP-NAME-WORKSPACE_ID.N.azure.databricksapps.com/mcp
 ```
 
----
+Any MCP client that supports **Streamable HTTP** transport and can authenticate to Databricks can connect.
 
-## Step 5 -- Publish to Microsoft Teams
+### Browser access
 
-1. In Copilot Studio, click **Publish** in the left navigation
-2. Confirm the publish action (takes 1-2 minutes)
-3. Go to **Channels > Microsoft Teams**
-4. Click **Turn on Teams**
-5. Options:
-   - **Open in Teams** -- for personal testing
-   - **Make available to others** -- share within your org
-   - **Submit to admin** -- submit to the Teams App Store for org-wide availability
+Navigate to the app URL in a browser while logged into the Databricks workspace. The `/health` endpoint shows server status:
+
+```
+https://YOUR-APP-NAME-WORKSPACE_ID.N.azure.databricksapps.com/health
+```
+
+### Copilot Studio / Teams integration
+
+Databricks Apps cannot be reached by external services like Copilot Studio. For that integration, use the **Azure Web Apps** version on the [`main` branch](https://github.com/sean-zhang-dbx/genie-mcp-copilot/tree/main).
 
 ---
 
@@ -436,9 +261,7 @@ curl -X POST http://localhost:8080/mcp \
 | `DATABRICKS_HOST` | Auto-injected | Databricks workspace URL. Auto-injected by Databricks Apps; set manually for local dev |
 | `DATABRICKS_CLIENT_ID` | Auto-injected | Service Principal client ID. Auto-injected by Databricks Apps; set manually for local dev |
 | `DATABRICKS_CLIENT_SECRET` | Auto-injected | Service Principal secret. Auto-injected by Databricks Apps; set manually for local dev |
-| `GENIE_SPACE_ID` | Yes | Genie Space ID. Resolved via `valueFrom` resource in `app.yaml` |
-| `AZURE_TENANT_ID` | For Copilot Studio | Entra ID tenant ID. Auth is **disabled** when this is unset |
-| `AZURE_CLIENT_ID` | For Copilot Studio | Server App Registration's client ID (used as the token audience) |
+| `GENIE_SPACE_ID` | Yes | Genie Space ID. Set in `app.yaml` or resolved from a managed resource |
 | `MLFLOW_TRACKING_URI` | Yes | Set to `databricks` -- required by the `databricks-ai-bridge` dependency |
 | `LOG_LEVEL` | No | Python logging level. Default: `INFO`. Options: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
@@ -460,50 +283,28 @@ README.md           This file
 
 ### App fails to start
 
-Check the app logs:
-
-```bash
-databricks apps logs YOUR-APP-NAME
-```
+Check the app logs in the Databricks workspace: go to **Compute > Apps > YOUR-APP-NAME > Logs**.
 
 Common causes:
-- **Missing Genie Space resource**: Ensure you added the Genie Space as a managed resource (Step 1d)
+- **Missing Genie Space ID**: Ensure `GENIE_SPACE_ID` is set in `app.yaml`
 - **Dependency install failure**: Check the build logs for pip errors
 - **Port mismatch**: Databricks Apps expects port 8080; verify `app.yaml` uses `--port 8080`
 
 ### "Error: GENIE_SPACE_ID not configured"
 
-The Genie Space resource is not attached or the key doesn't match. Verify:
-- The resource key in the Apps UI is `genie-space` (matching `app.yaml`)
-- The resource status shows as connected
+The `GENIE_SPACE_ID` env var is missing or empty. Set it in `app.yaml` and redeploy. You can find the Genie Space ID in the URL:
 
-### "Invalid token audience" (HTTP 401)
-
-The OAuth token's `aud` claim does not match the server's expected audience. Verify:
-- `AZURE_CLIENT_ID` is set to the **Server** App Registration's client ID (not the Client app)
-- The Copilot Studio scope is `api://SERVER-APP-CLIENT-ID/.default`
-
-### "Token signing key not found" (HTTP 401)
-
-The token's `kid` was not found in Microsoft's JWKS. This can happen if:
-- The token is from a different identity provider (not Entra ID)
-- There is a network issue reaching `login.microsoftonline.com` from the Databricks Apps network
-
-### AADSTS700016: Application not found in directory
-
-Copilot Studio is in a **different tenant** than the app registrations. Fix:
-1. Change both app registrations to **multi-tenant** (Accounts in any organizational directory)
-2. Update the Copilot Studio OAuth URLs to use `/common/` instead of a specific tenant ID
-3. Ensure the code uses the `/common` JWKS endpoint (the default)
-
-### AADSTS900144: Missing 'scope' parameter
-
-Copilot Studio is not sending the scope. In the tool OAuth config, set:
-- **Scope**: `api://SERVER-APP-CLIENT-ID/.default`
+```
+https://YOUR-WORKSPACE.azuredatabricks.net/genie/rooms/THIS-IS-THE-ID?o=...
+```
 
 ### Genie returns "Model registry functionality is unavailable"
 
 The `MLFLOW_TRACKING_URI` env var is not set. Verify it's set to `databricks` in `app.yaml`.
+
+### Genie returns permission errors
+
+The app's auto-provisioned Service Principal needs access to the Genie Space and underlying tables. See Step 1e.
 
 ---
 
@@ -526,8 +327,6 @@ The `MLFLOW_TRACKING_URI` env var is not set. Verify it's set to `databricks` in
 
 **Auto-injected Service Principal**: Databricks Apps automatically provisions an SP for each app and injects credentials. You only need to grant this SP access to the Genie Space and underlying tables -- no manual secret management.
 
-**Entra ID auth is optional**: When `AZURE_TENANT_ID` is unset, the middleware passes all requests through without validation. This is the default for Databricks Apps. Enable it only when connecting Copilot Studio.
+**Databricks-native auth**: Requests are authenticated via Databricks' session management. The Entra ID middleware in `app.py` is effectively unused in this deployment since Databricks handles auth before the request reaches the app.
 
-**Multi-tenant by default**: The code uses the `/common` JWKS endpoint and skips issuer validation, allowing tokens from any Entra ID tenant. For stricter security, switch to single-tenant mode (see [Step 2](#single-tenant-vs-multi-tenant-code-configuration)).
-
-**Streamable HTTP transport**: Copilot Studio requires MCP servers to use Streamable HTTP. FastMCP's `http_app()` provides this on the `/mcp` endpoint.
+**Streamable HTTP transport**: The MCP server uses FastMCP's `http_app()` which provides Streamable HTTP on the `/mcp` endpoint, compatible with any MCP client that supports this transport.

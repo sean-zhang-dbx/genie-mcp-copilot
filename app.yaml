@@ -1,6 +1,5 @@
 # Databricks Apps configuration
-# Databricks auto-injects DATABRICKS_HOST, DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET
-# so they are not listed here.
+# DATABRICKS_HOST, DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET are auto-injected.
 
 command:
   - "uvicorn"
@@ -11,25 +10,11 @@ command:
   - "8080"
 
 env:
-  # Genie Space ID — resolved from the managed resource below
   - name: GENIE_SPACE_ID
-    valueFrom:
-      resource: genie-space
-
-  # Microsoft Entra ID auth (optional — only needed for Copilot Studio integration)
-  - name: AZURE_TENANT_ID
-    value: ""
-  - name: AZURE_CLIENT_ID
     value: ""
 
-  # MLflow tracking URI (required by databricks-ai-bridge)
   - name: MLFLOW_TRACKING_URI
     value: "databricks"
 
   - name: LOG_LEVEL
     value: "INFO"
-
-resources:
-  - name: genie-space
-    genie_space:
-      permission: CAN_RUN
