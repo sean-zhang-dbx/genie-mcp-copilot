@@ -1,17 +1,19 @@
-# Databricks Apps configuration
-# DATABRICKS_HOST, DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET are auto-injected.
-
 command:
+  - "uv"
+  - "run"
   - "uvicorn"
   - "app:app"
   - "--host"
   - "0.0.0.0"
   - "--port"
-  - "8080"
+  - "8000"
 
 env:
+  - name: DATABRICKS_HOST
+    value: "https://adb-7405617466365502.2.azuredatabricks.net/"
+
   - name: GENIE_SPACE_ID
-    value: ""
+    value: "01f10b358d7d15059ba11fc7350ab176"
 
   - name: MLFLOW_TRACKING_URI
     value: "databricks"

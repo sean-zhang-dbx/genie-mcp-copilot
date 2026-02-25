@@ -1,28 +1,23 @@
-# Genie MCP Server (Databricks Apps)
+# Genie MCP Server for Microsoft Copilot Studio
 
 [![GitHub](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/sean-zhang-dbx/genie-mcp-copilot)
 
-> **This is the Databricks Apps branch.** For the Azure Web Apps version (required for Copilot Studio / Teams integration), see the [`main`](https://github.com/sean-zhang-dbx/genie-mcp-copilot/tree/main) branch.
+An MCP (Model Context Protocol) server deployed as a **Databricks App** that connects **Microsoft Copilot Studio** to **Databricks Genie** using Databricks-native OAuth (OIDC).
 
-An MCP (Model Context Protocol) server that connects **Databricks Genie** to any MCP-compatible client. Deployed as a **Databricks App** with Databricks-native authentication.
-
-Users or MCP clients send natural-language questions to the server, which forwards them to a Databricks Genie Space and returns the answer.
-
-> **Important: Databricks Apps vs Azure Web Apps**
->
-> Databricks Apps are behind Databricks' own session authentication. This means **only clients that can authenticate to Databricks** (e.g. users in a browser, Claude Desktop with Databricks auth, Cursor) can reach this endpoint. **External services like Copilot Studio cannot directly call Databricks Apps** because they cannot complete Databricks' OAuth login flow.
->
-> - **For Copilot Studio / Teams**: Use the [`main` branch](https://github.com/sean-zhang-dbx/genie-mcp-copilot/tree/main) (Azure Web Apps deployment)
-> - **For MCP clients with Databricks auth**: Use this branch (Databricks Apps deployment)
+Users ask natural-language questions in Teams (via Copilot Studio), which are forwarded to a Genie Space and return structured answers with SQL and results.
 
 ## Architecture
 
 ```
-MCP Client (Claude Desktop, Cursor, browser, etc.)
-    |  Databricks session auth (browser) or Databricks OAuth
+Teams User
+    |  Chat message
+    v
+Microsoft Copilot Studio
+    |  MCP tool call (Streamable HTTP)
+    |  Databricks OIDC OAuth (user token)
     v
 Databricks App  (FastAPI + FastMCP)
-    |  Auto-injected Service Principal credentials
+    |  On-Behalf-Of: user token from headers
     v
 Databricks Genie Space
     |
@@ -30,216 +25,264 @@ Databricks Genie Space
 Unity Catalog Tables
 ```
 
-**Authentication:** Databricks Apps automatically provisions a Service Principal for each app and injects `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`, and `DATABRICKS_CLIENT_SECRET` into the environment. Users authenticate to the app via Databricks' own session management (browser login).
+**Authentication flow:** Copilot Studio authenticates the user via Databricks OIDC (`/oidc/v1/authorize`). Databricks passes the user's token to the app through HTTP headers (`x-forwarded-access-token`). The app creates a per-user `WorkspaceClient` with that token, so Genie queries respect the user's permissions (OBO pattern). If no user token is present, the app falls back to its auto-injected Service Principal credentials.
 
 ---
 
 ## Prerequisites
 
-- **Databricks CLI** (`databricks`) -- [Install](https://docs.databricks.com/dev-tools/cli/install.html)
+- **Databricks CLI** -- [Install](https://docs.databricks.com/dev-tools/cli/install.html)
 - A **Databricks workspace** (Azure) with at least one Genie Space configured
-- **Workspace admin** access (to grant the app's Service Principal access to the Genie Space)
+- **Workspace admin** access (to grant the app's SP access to the Genie Space)
+- **Databricks Account Console** access (to create an OAuth App Connection)
+- **Microsoft Copilot Studio** access
+
+---
+
+## Project Structure
+
+```
+app.py              FastAPI + FastMCP server with OBO token passthrough
+app.yaml            Databricks App config (uv runner, env vars)
+pyproject.toml      Python dependencies (managed by uv)
+requirements.txt    Bootstrap dependency (uv) for Databricks Apps
+README.md           This file
+```
 
 ---
 
 ## Customization
 
-Before deploying, customize the server metadata and tool descriptions in `app.py` to match your use case. These values are exposed to Copilot Studio and affect how the agent selects and describes tools.
+Before deploying, edit `app.py` to match your domain:
 
 ### Server name and instructions
 
-Edit the `FastMCP(...)` constructor (around line 137):
-
 ```python
 mcp_server = FastMCP(
-    "YOUR SERVER NAME",               # Visible in Copilot Studio tool list
+    "YOUR SERVER NAME",
     instructions=(
-        "Description of what this server does.\n\n"
-        "Available data:\n"
+        "Description of your data domain.\n\n"
+        "Available Tables:\n"
         "- table_a: description\n"
-        "- table_b: description\n\n"
-        "Use query_genie for exploratory analysis."
+        "- table_b: description\n"
     ),
 )
 ```
 
-### Tool description and parameter help text
-
-Edit the `@mcp_server.tool()` function (around line 150):
+### Tool description
 
 ```python
 @mcp_server.tool()
 def query_genie(
-    query: Annotated[
-        str,
-        "Natural language question about YOUR DATA. Be specific with dates and metrics.",
-    ],
-    conversation_id: Annotated[
-        Optional[str],
-        "Continue a previous conversation by passing its ID. Omit for new query.",
-    ] = None,
-) -> str:
-    """Query Databricks Genie for YOUR DOMAIN analysis using natural language.
-
-    Best for: complex exploratory analysis, trend comparisons, multi-table queries.
-
-    Example: query_genie(query="Show revenue by region for Q3 2025")
-    """
-```
-
-### Adding more tools
-
-You can add additional MCP tools beyond `query_genie`. Each `@mcp_server.tool()` function becomes a separate tool in Copilot Studio:
-
-```python
-@mcp_server.tool()
-def get_summary_report(
-    period: Annotated[str, "Time period, e.g. '2025-Q3' or 'last 30 days'"],
-) -> str:
-    """Return a pre-built summary report for the given period."""
-    # Your implementation here
+    query: Annotated[str, "Natural language question about YOUR DATA."],
     ...
+) -> str:
+    """Query Databricks Genie for YOUR DOMAIN analysis."""
 ```
 
 ---
 
-## Step 1 -- Deploy to Databricks Apps
+## Part 1 -- Deploy to Databricks Apps
 
-### 1a. Authenticate the Databricks CLI
-
-```bash
-databricks configure --host https://YOUR-WORKSPACE.azuredatabricks.net
-```
-
-### 1b. Create the app
+### 1.1 Authenticate the Databricks CLI
 
 ```bash
-databricks apps create --name YOUR-APP-NAME --description "Genie MCP Server for Copilot Studio"
+databricks configure --host https://<your-workspace>.azuredatabricks.net
 ```
 
-### 1c. Deploy the code
+### 1.2 Update `app.yaml`
 
-From the project root directory:
+Set `DATABRICKS_HOST` and `GENIE_SPACE_ID` for your workspace:
+
+```yaml
+env:
+  - name: DATABRICKS_HOST
+    value: "https://<your-workspace>.azuredatabricks.net/"
+  - name: GENIE_SPACE_ID
+    value: "<your-genie-space-id>"
+  - name: MLFLOW_TRACKING_URI
+    value: "databricks"
+```
+
+Find your Genie Space ID in the URL: `https://<workspace>/genie/rooms/<THIS-IS-THE-ID>?o=...`
+
+### 1.3 Create the app
 
 ```bash
-databricks apps deploy YOUR-APP-NAME --source-code-path .
+databricks apps create <your-app-name> --description "Genie MCP Server for Copilot Studio"
 ```
 
-This uploads the code and starts the app. The first deployment takes 2-5 minutes.
+### 1.4 Deploy the code
 
-### 1d. Add the Genie Space resource
+```bash
+databricks apps deploy <your-app-name> --source-code-path .
+```
 
-After the app is created, you need to attach your Genie Space as a managed resource:
+First deployment takes 2-5 minutes. Monitor with:
 
-1. In the Databricks workspace, go to **Compute > Apps**
-2. Click on your app name
-3. Go to the **Resources** tab
-4. Click **Add resource**
-5. Select **Genie space** as the resource type
-6. Select your Genie Space
-7. Set the key to `genie-space` (must match the `app.yaml` resource name)
-8. Set permission to **Can Run**
-9. Click **Save** and redeploy if prompted
+```bash
+databricks apps get <your-app-name>
+```
 
-### 1e. Grant the app's Service Principal access
+### 1.5 Grant the app's Service Principal access
 
-Databricks Apps auto-creates a Service Principal for each app. You need to grant it access to the Genie Space's underlying data:
+Databricks Apps auto-creates a Service Principal. Grant it access to your Genie Space and data:
 
-1. Find the app's SP name: go to **Compute > Apps > YOUR-APP-NAME > Settings** and note the Service Principal name
-2. Open the Genie Space and click **Share** -- add the SP with **Can Run** permission
-3. Grant the SP access to the underlying tables:
+1. Go to **Compute > Apps > your-app > Settings** and note the SP name
+2. Open the Genie Space > **Share** > add the SP with **Can Run** permission
+3. Grant table access:
 
 ```sql
--- Replace with your catalog/schema names and the app's SP name
-GRANT USE CATALOG ON CATALOG your_catalog TO `YOUR-APP-NAME`;
-GRANT USE SCHEMA ON SCHEMA your_catalog.your_schema TO `YOUR-APP-NAME`;
-GRANT SELECT ON SCHEMA your_catalog.your_schema TO `YOUR-APP-NAME`;
+GRANT USE CATALOG ON CATALOG <your_catalog> TO `<your-app-name>`;
+GRANT USE SCHEMA ON SCHEMA <your_catalog>.<your_schema> TO `<your-app-name>`;
+GRANT SELECT ON SCHEMA <your_catalog>.<your_schema> TO `<your-app-name>`;
 ```
 
-### 1f. Verify the deployment
+### 1.6 Verify
 
-```bash
-# Check app status
-databricks apps get YOUR-APP-NAME
+The app URL follows this pattern:
 
-# Get the app URL
-databricks apps get YOUR-APP-NAME --output json | python3 -c "import sys,json; print(json.load(sys.stdin).get('url',''))"
+```
+https://<your-app-name>-<workspace-id>.<N>.azure.databricksapps.com
 ```
 
-Test the health endpoint:
-
-```bash
-curl https://YOUR-WORKSPACE.azuredatabricks.net/apps/YOUR-APP-NAME/health
-```
-
-Expected response:
-
-```json
-{
-  "status": "healthy",
-  "genie_configured": true,
-  "databricks_configured": true,
-  "entra_auth_enabled": false
-}
-```
-
-> `entra_auth_enabled` is `false` until you configure the Entra ID env vars (Step 2).
-
-The MCP endpoint is at: `https://YOUR-WORKSPACE.azuredatabricks.net/apps/YOUR-APP-NAME/mcp`
+Open it in a browser while logged into the workspace. If you see the FastAPI docs page or an MCP response, the app is running.
 
 ---
 
-## Step 2 -- Using the MCP Server
+## Part 2 -- Connect to Copilot Studio
 
-Once deployed, the MCP endpoint is available at:
+### 2.1 Create an OAuth App Connection in Databricks
 
-```
-https://YOUR-APP-NAME-WORKSPACE_ID.N.azure.databricksapps.com/mcp
-```
+1. Go to the **Databricks Account Console** > **Settings** > **App connections**
+2. Click **Add connection**
+3. Fill in:
+   - **Name**: `copilot-studio-mcp` (or any descriptive name)
+   - **Redirect URLs**: Add the redirect URL from Copilot Studio (you'll get this in step 2.3)
+   - **Access scopes**: `all-apis offline_access`
+   - **Generate a client secret** and save it securely
+4. Note the **Client ID** and **Client Secret**
 
-Any MCP client that supports **Streamable HTTP** transport and can authenticate to Databricks can connect.
+### 2.2 Identify your OIDC endpoints
 
-### Browser access
+Your workspace OIDC endpoints are:
 
-Navigate to the app URL in a browser while logged into the Databricks workspace. The `/health` endpoint shows server status:
+| Endpoint | URL |
+|----------|-----|
+| Authorization | `https://<your-workspace>.azuredatabricks.net/oidc/v1/authorize` |
+| Token | `https://<your-workspace>.azuredatabricks.net/oidc/v1/token` |
+| Scopes | `all-apis offline_access` |
 
-```
-https://YOUR-APP-NAME-WORKSPACE_ID.N.azure.databricksapps.com/health
-```
+### 2.3 Configure Copilot Studio
 
-### Copilot Studio / Teams integration
+1. In Copilot Studio, create or open your agent
+2. Go to **Settings** > **Security** > **Authentication**
+3. Select **Authenticate with Microsoft** or **OAuth 2.0** (manual)
+4. Configure:
+   - **Authorization URL**: `https://<your-workspace>.azuredatabricks.net/oidc/v1/authorize`
+   - **Token URL**: `https://<your-workspace>.azuredatabricks.net/oidc/v1/token`
+   - **Client ID**: from step 2.1
+   - **Client Secret**: from step 2.1
+   - **Scope**: `all-apis offline_access`
+5. Copy the **Redirect URL** shown by Copilot Studio
+6. Go back to the Databricks Account Console and add this redirect URL to your app connection (step 2.1)
 
-Databricks Apps cannot be reached by external services like Copilot Studio. For that integration, use the **Azure Web Apps** version on the [`main` branch](https://github.com/sean-zhang-dbx/genie-mcp-copilot/tree/main).
+### 2.4 Add the MCP tool action
+
+1. In Copilot Studio, go to **Actions** > **Add action**
+2. Select **MCP Server (Streamable HTTP)**
+3. Enter the MCP endpoint URL:
+   ```
+   https://<your-app-name>-<workspace-id>.<N>.azure.databricksapps.com/mcp
+   ```
+4. Copilot Studio discovers the `query_genie` tool automatically
+5. Configure the tool description if needed and publish
+
+### 2.5 Test in Copilot Studio
+
+Use the **Test** panel to ask a question like:
+
+> "What is the CTRP performance for last quarter?"
+
+You should see:
+- Copilot Studio prompts the user to authenticate (first time)
+- After login, the query is sent to Genie via the MCP tool
+- The response includes SQL, description, and results
+
+---
+
+## Part 3 -- Private Link Configuration
+
+If your Databricks workspace uses Azure Private Link, Copilot Studio (running in Microsoft's cloud) cannot reach the workspace URLs by default. Here are three approaches, from simplest to most secure.
+
+### Option A: Hybrid Mode (Public Access + Private Link + IP ACLs)
+
+Keep Private Link for internal users while allowing Copilot Studio through restricted public access.
+
+1. **Enable public network access** alongside Private Link in the workspace network settings (Azure Portal > Databricks workspace > Networking)
+2. **Add IP access lists** to restrict public access to Power Platform IPs only:
+   - Use the `PowerPlatformInfra` and `PowerPlatformPlex` Azure service tags
+   - In Databricks: **Settings** > **Security** > **IP Access Lists**
+   - IP ACLs only apply to public traffic; Private Link traffic bypasses them
+
+This is the simplest option. Internal users continue using Private Link. Only whitelisted Power Platform IPs can access the workspace publicly.
+
+### Option B: Power Platform VNet Integration
+
+Route Copilot Studio traffic through a VNet that has a Private Endpoint to Databricks.
+
+1. Configure **VNet support for the Power Platform environment** (requires a Managed Environment)
+2. Create an **Azure Private Endpoint for Databricks** in the VNet
+3. Set up **conditional DNS forwarding** for `*.azuredatabricks.net` and `*.databricksapps.com`
+4. Copilot Studio agent traffic routes through the VNet's private connection
+
+**Caveat:** VNet integration covers HTTP Request nodes and supported connectors. MCP tool connections may take a different code path -- test to confirm MCP calls route through the VNet.
+
+### Option C: Azure API Management (APIM) Reverse Proxy
+
+Deploy APIM as a bridge between public Copilot Studio and private Databricks.
+
+1. Deploy **APIM in the customer's VNet** with a public frontend
+2. APIM accesses Databricks via the **Private Endpoint** in the VNet
+3. Configure APIM to proxy:
+   - `/oidc/v1/authorize` and `/oidc/v1/token` (OAuth endpoints)
+   - `/apps/<your-app-name>/*` (the MCP server)
+4. Point Copilot Studio to the APIM URL instead of the Databricks URL
+
+Most complex but works when public access is completely disabled.
+
+### Recommendation
+
+| Network Config | Recommended Approach |
+|---|---|
+| Public workspace (default) | No extra config needed |
+| IP ACLs only | Whitelist Power Platform IPs (PDF section 3.5) |
+| Private Link (hybrid OK) | **Option A** -- simplest, enable public + IP ACLs |
+| Private Link (strict, no public) | **Option B** first, fall back to **Option C** |
 
 ---
 
 ## Local Development
 
-For local development, Entra ID auth is automatically disabled when `AZURE_TENANT_ID` is not set.
-
 ```bash
 # Install dependencies
-pip install -r requirements.txt
+pip install uv
+uv sync
 
-# Set Databricks credentials
-export DATABRICKS_HOST="https://YOUR-WORKSPACE.azuredatabricks.net"
-export DATABRICKS_CLIENT_ID="your-sp-client-id"
-export DATABRICKS_CLIENT_SECRET="your-sp-client-secret"
-export GENIE_SPACE_ID="your-genie-space-id"
-export MLFLOW_TRACKING_URI="databricks"
+# Set credentials
+export DATABRICKS_HOST="https://<your-workspace>.azuredatabricks.net"
+export DATABRICKS_CLIENT_ID="<your-sp-client-id>"
+export DATABRICKS_CLIENT_SECRET="<your-sp-client-secret>"
+export GENIE_SPACE_ID="<your-genie-space-id>"
 
 # Start the server
-uvicorn app:app --host 0.0.0.0 --port 8080 --reload
+uv run uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Test the endpoints:
+Test the MCP endpoint:
 
 ```bash
-# Health check
-curl http://localhost:8080/health
-
-# MCP initialize (no auth when Entra is disabled)
-curl -X POST http://localhost:8080/mcp \
+curl -X POST http://localhost:8000/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{
@@ -254,28 +297,16 @@ curl -X POST http://localhost:8080/mcp \
 
 ---
 
-## Environment Variables Reference
+## Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `DATABRICKS_HOST` | Auto-injected | Databricks workspace URL. Auto-injected by Databricks Apps; set manually for local dev |
-| `DATABRICKS_CLIENT_ID` | Auto-injected | Service Principal client ID. Auto-injected by Databricks Apps; set manually for local dev |
-| `DATABRICKS_CLIENT_SECRET` | Auto-injected | Service Principal secret. Auto-injected by Databricks Apps; set manually for local dev |
-| `GENIE_SPACE_ID` | Yes | Genie Space ID. Set in `app.yaml` or resolved from a managed resource |
-| `MLFLOW_TRACKING_URI` | Yes | Set to `databricks` -- required by the `databricks-ai-bridge` dependency |
-| `LOG_LEVEL` | No | Python logging level. Default: `INFO`. Options: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-
----
-
-## Project Structure
-
-```
-app.py              Main application -- FastAPI + FastMCP server with Entra ID middleware
-app.yaml            Databricks Apps configuration (command, env, resources)
-requirements.txt    Python dependencies
-images/             Architecture diagrams
-README.md           This file
-```
+| Variable | Source | Description |
+|----------|--------|-------------|
+| `DATABRICKS_HOST` | `app.yaml` | Workspace URL |
+| `DATABRICKS_CLIENT_ID` | Auto-injected | App SP client ID (set automatically by Databricks Apps) |
+| `DATABRICKS_CLIENT_SECRET` | Auto-injected | App SP secret (set automatically by Databricks Apps) |
+| `GENIE_SPACE_ID` | `app.yaml` | Genie Space ID |
+| `MLFLOW_TRACKING_URI` | `app.yaml` | Must be `databricks` (required by `databricks-ai-bridge`) |
+| `LOG_LEVEL` | `app.yaml` | Python log level (default: `INFO`) |
 
 ---
 
@@ -283,50 +314,42 @@ README.md           This file
 
 ### App fails to start
 
-Check the app logs in the Databricks workspace: go to **Compute > Apps > YOUR-APP-NAME > Logs**.
+Check logs: **Compute > Apps > your-app > Logs**. Common causes:
 
-Common causes:
-- **Missing Genie Space ID**: Ensure `GENIE_SPACE_ID` is set in `app.yaml`
-- **Dependency install failure**: Check the build logs for pip errors
-- **Port mismatch**: Databricks Apps expects port 8080; verify `app.yaml` uses `--port 8080`
+- **Missing `GENIE_SPACE_ID`** in `app.yaml`
+- **Dependency install failure** -- check build logs for `uv` errors
+- **Port mismatch** -- `app.yaml` must use `--port 8000`
 
 ### "Error: GENIE_SPACE_ID not configured"
 
-The `GENIE_SPACE_ID` env var is missing or empty. Set it in `app.yaml` and redeploy. You can find the Genie Space ID in the URL:
-
-```
-https://YOUR-WORKSPACE.azuredatabricks.net/genie/rooms/THIS-IS-THE-ID?o=...
-```
+Set `GENIE_SPACE_ID` in `app.yaml` and redeploy. Find it in the Genie Space URL:
+`https://<workspace>/genie/rooms/<THIS-IS-THE-ID>?o=...`
 
 ### Genie returns "Model registry functionality is unavailable"
 
-The `MLFLOW_TRACKING_URI` env var is not set. Verify it's set to `databricks` in `app.yaml`.
+The `MLFLOW_TRACKING_URI` env var is not set or not set to `databricks`. Verify it's in `app.yaml` and redeploy.
 
-### Genie returns permission errors
+### Genie returns "Node with resource name ... does not exist"
 
-The app's auto-provisioned Service Principal needs access to the Genie Space and underlying tables. See Step 1e.
+The app's SP doesn't have `CAN_RUN` permission on the Genie Space. Grant it via the permissions API using the SP's application ID (not display name):
 
----
+```bash
+curl -X PUT "https://<workspace>/api/2.0/permissions/genie/<space-id>" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"access_control_list": [{"service_principal_name": "<sp-application-id>", "permission_level": "CAN_RUN"}]}'
+```
 
-## Comparison: Databricks Apps vs Azure Web Apps
+### Genie returns other permission errors
 
-| Feature | Databricks Apps (this branch) | Azure Web Apps (`main` branch) |
-|---------|-------------------------------|-------------------------------|
-| Deployment | `databricks apps deploy` | `az webapp up` |
-| Service Principal | Auto-provisioned | Manual creation required |
-| Genie Space access | Managed resource (`valueFrom`) | Manual env var |
-| Port | 8080 | 8000 |
-| Startup script | Not needed (`app.yaml` command) | `startup.sh` |
-| Entra ID auth | Optional (for Copilot Studio) | Optional (for Copilot Studio) |
-| Network | Databricks workspace network | Azure App Service network |
-| Cost | Included in Databricks compute | Separate Azure App Service Plan |
+The app's SP needs access to the underlying tables. See Part 1, step 1.5.
 
----
+### Copilot Studio authentication fails
 
-## Design Decisions
+- Verify the **redirect URL** in the Databricks App Connection matches what Copilot Studio provides
+- Confirm **scopes** are set to `all-apis offline_access`
+- Check that the OIDC endpoints match your workspace URL (not the app URL)
 
-**Auto-injected Service Principal**: Databricks Apps automatically provisions an SP for each app and injects credentials. You only need to grant this SP access to the Genie Space and underlying tables -- no manual secret management.
+### IP access list blocks Copilot Studio
 
-**Databricks-native auth**: Requests are authenticated via Databricks' session management. The Entra ID middleware in `app.py` is effectively unused in this deployment since Databricks handles auth before the request reaches the app.
-
-**Streamable HTTP transport**: The MCP server uses FastMCP's `http_app()` which provides Streamable HTTP on the `/mcp` endpoint, compatible with any MCP client that supports this transport.
+If using IP ACLs, ensure the `PowerPlatformInfra` and `PowerPlatformPlex` service tag IPs are whitelisted. See Part 3, Option A.
