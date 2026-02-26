@@ -41,6 +41,21 @@ Databricks Genie Space --> Unity Catalog Tables
 - **Databricks Account Console** access (to create an OAuth App Connection)
 - **Microsoft Copilot Studio** access ([copilotstudio.microsoft.com](https://copilotstudio.microsoft.com))
 
+### Required admin roles
+
+Several steps require elevated permissions. The table below shows which role is needed where:
+
+| Step | What | Required Role |
+|------|------|---------------|
+| Part 1 | Create VNet, NSG, PE, DNS, workspace | **Azure Subscription Contributor** (or Owner) |
+| Part 2.3 | Create a Databricks App | **Databricks workspace admin** |
+| Part 2.4 | Grant SP permissions on Genie Space, warehouse, and UC tables | **Databricks workspace admin** + **UC catalog/schema owner** (or admin) |
+| Part 3 | Create OAuth App Connection | **Databricks account admin** |
+| Part 4 | Create Copilot Studio agent | **Copilot Studio environment maker** (or admin) |
+| Part 5 | Configure IP access lists | **Databricks workspace admin** |
+
+> If you are not an admin for all of the above, coordinate with the relevant admins before starting. Parts 1, 2.4, 3, and 5 are the most common steps that require someone else's help.
+
 ---
 
 ## Quick Start
@@ -52,6 +67,8 @@ Databricks Genie Space --> Unity Catalog Tables
 ## Part 1 -- Azure Infrastructure
 
 > **Skip this part** if your workspace is already VNet-injected with Private Link configured and public network access enabled (hybrid mode). Proceed directly to Part 2.
+>
+> **Requires:** Azure Subscription Contributor or Owner role.
 
 ### 1.1 Create VNet and subnets
 
@@ -249,7 +266,7 @@ env:
     value: "INFO"
 ```
 
-### 2.3 Upload and deploy
+### 2.3 Upload and deploy *(requires workspace admin)*
 
 ```bash
 APP_NAME="genie-mcp-copilot"
@@ -270,7 +287,7 @@ Wait for `app_status.state = RUNNING` (~2-5 minutes):
 databricks apps get $APP_NAME
 ```
 
-### 2.4 Grant the app's SP permissions
+### 2.4 Grant the app's SP permissions *(requires workspace admin + UC owner)*
 
 Find the SP Application ID from the app details, then:
 
@@ -321,7 +338,7 @@ curl -sS -X POST "$MCP_URL" \
 
 ---
 
-## Part 3 -- Databricks OAuth App Connection
+## Part 3 -- Databricks OAuth App Connection *(requires account admin)*
 
 1. Go to [Databricks Account Console](https://accounts.azuredatabricks.net) > **Settings** > **App connections**
 2. Click **Add connection**
@@ -392,7 +409,7 @@ Click **Create**. Copilot Studio connects to the MCP server and auto-discovers t
 
 ---
 
-## Part 5 -- IP Access Lists (Securing Hybrid Mode)
+## Part 5 -- IP Access Lists (Securing Hybrid Mode) *(requires workspace admin)*
 
 With Private Link + hybrid mode, the workspace is publicly accessible. To lock it down so only your IPs and Copilot Studio can access it:
 
