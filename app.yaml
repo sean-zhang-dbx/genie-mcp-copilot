@@ -10,10 +10,10 @@ command:
 
 env:
   - name: DATABRICKS_HOST
-    value: "https://adb-7405617466365502.2.azuredatabricks.net/"
+    value: "https://adb-7405615748748962.2.azuredatabricks.net/"
 
   - name: GENIE_SPACE_ID
-    value: "01f10b358d7d15059ba11fc7350ab176"
+    value: "01f1125a7bb61c0ea2cb19a8af1365f4"
 
   - name: MLFLOW_TRACKING_URI
     value: "databricks"

@@ -1,10 +1,12 @@
-# Genie MCP Server for Microsoft Copilot Studio
+# Genie MCP Server for Copilot Studio -- Private Link Edition
 
 [![GitHub](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/sean-zhang-dbx/genie-mcp-copilot)
 
-An MCP (Model Context Protocol) server deployed as a **Databricks App** that connects **Microsoft Copilot Studio** to **Databricks Genie** using Databricks-native OAuth (OIDC).
+An MCP server deployed as a **Databricks App** on a **VNet-injected, Private Link-enabled workspace** that connects **Microsoft Copilot Studio** to **Databricks Genie**.
 
-Users ask natural-language questions in Teams (via Copilot Studio), which are forwarded to a Genie Space and return structured answers with SQL and results.
+This branch demonstrates the full end-to-end setup with Azure Private Link, including VNet injection, Private Endpoints, Private DNS, and hybrid public/private access for Copilot Studio compatibility.
+
+> For a version without Private Link, see the [`databricks-apps`](https://github.com/sean-zhang-dbx/genie-mcp-copilot/tree/databricks-apps) branch.
 
 ## Architecture
 
@@ -12,87 +14,210 @@ Users ask natural-language questions in Teams (via Copilot Studio), which are fo
 Teams User
     |  Chat message
     v
-Microsoft Copilot Studio
+Microsoft Copilot Studio (Microsoft cloud)
     |  MCP tool call (Streamable HTTP)
     |  Databricks OIDC OAuth (user token)
+    |  --- public internet (IP ACL restricted) --->
+    v
+Azure Databricks Workspace (VNet-injected + Private Link)
+    |  Hybrid mode: public access ON + IP ACLs
+    |  Private Endpoint: 10.0.1.4 (databricks_ui_api)
     v
 Databricks App  (FastAPI + FastMCP)
-    |  On-Behalf-Of: user token from headers
+    |  OBO: user token from x-forwarded-access-token header
     v
-Databricks Genie Space
-    |
-    v
-Unity Catalog Tables
+Databricks Genie Space --> Unity Catalog Tables
 ```
 
-**Authentication flow:** Copilot Studio authenticates the user via Databricks OIDC (`/oidc/v1/authorize`). The user's token is passed through to the MCP server via HTTP headers. The app creates a per-user `WorkspaceClient` with that token, so Genie queries respect the user's Unity Catalog permissions (OBO pattern). If no user token is present, the app falls back to its auto-injected Service Principal credentials.
+**Key design:** The workspace runs in hybrid mode -- Private Link is enabled for internal users via the Private Endpoint, while Copilot Studio accesses the workspace publicly through IP-restricted access (Power Platform IPs only). The Databricks App URL (`*.databricksapps.com`) is inherently public-facing, so Copilot Studio can reach it. The OIDC endpoints (`/oidc/v1/authorize`, `/oidc/v1/token`) also need public access for the OAuth flow.
 
 ---
 
 ## Prerequisites
 
+- **Azure CLI** -- [Install](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
 - **Databricks CLI** -- [Install](https://docs.databricks.com/dev-tools/cli/install.html)
-- A **Databricks workspace** (Azure) with at least one Genie Space configured
-- **Workspace admin** access (to grant the app's SP access to the Genie Space)
+- An **Azure subscription** with permissions to create VNets, NSGs, Private Endpoints, DNS zones, and Databricks workspaces
 - **Databricks Account Console** access (to create an OAuth App Connection)
 - **Microsoft Copilot Studio** access ([copilotstudio.microsoft.com](https://copilotstudio.microsoft.com))
 
 ---
 
-## Project Structure
+## Part 1 -- Azure Infrastructure
 
-```
-app.py              FastAPI + FastMCP server with OBO token passthrough
-app.yaml            Databricks App config (uv runner, env vars)
-pyproject.toml      Python dependencies (managed by uv)
-requirements.txt    Bootstrap dependency (uv) for Databricks Apps
-README.md           This file
-```
-
----
-
-## Customization
-
-Before deploying, edit `app.py` to match your domain:
-
-### Server name and instructions
-
-```python
-mcp_server = FastMCP(
-    "YOUR SERVER NAME",
-    instructions=(
-        "Description of your data domain.\n\n"
-        "Available Tables:\n"
-        "- table_a: description\n"
-        "- table_b: description\n"
-    ),
-)
-```
-
-### Tool description
-
-```python
-@mcp_server.tool()
-def query_genie(
-    query: Annotated[str, "Natural language question about YOUR DATA."],
-    ...
-) -> str:
-    """Query Databricks Genie for YOUR DOMAIN analysis."""
-```
-
----
-
-## Part 1 -- Deploy to Databricks Apps
-
-### 1.1 Authenticate the Databricks CLI
+### 1.1 Create VNet and subnets
 
 ```bash
-databricks auth login --host https://<your-workspace>.azuredatabricks.net
+RESOURCE_GROUP="<your-resource-group>"
+LOCATION="<your-region>"    # e.g. eastus2
+VNET_NAME="vnet-databricks"
+
+# VNet with a subnet for Private Endpoints
+az network vnet create \
+  --name $VNET_NAME \
+  --resource-group $RESOURCE_GROUP \
+  --location $LOCATION \
+  --address-prefix 10.0.0.0/16 \
+  --subnet-name snet-private-endpoints \
+  --subnet-prefix 10.0.1.0/24
+
+# Disable PE network policies
+az network vnet subnet update \
+  --name snet-private-endpoints \
+  --resource-group $RESOURCE_GROUP \
+  --vnet-name $VNET_NAME \
+  --private-endpoint-network-policies Disabled
+
+# Databricks public subnet (delegated)
+az network vnet subnet create \
+  --name snet-databricks-public \
+  --resource-group $RESOURCE_GROUP \
+  --vnet-name $VNET_NAME \
+  --address-prefix 10.0.2.0/24 \
+  --delegations Microsoft.Databricks/workspaces
+
+# Databricks private subnet (delegated)
+az network vnet subnet create \
+  --name snet-databricks-private \
+  --resource-group $RESOURCE_GROUP \
+  --vnet-name $VNET_NAME \
+  --address-prefix 10.0.3.0/24 \
+  --delegations Microsoft.Databricks/workspaces
 ```
 
-### 1.2 Update `app.yaml`
+### 1.2 Create NSG and attach
 
-Set `DATABRICKS_HOST` and `GENIE_SPACE_ID` for your workspace:
+```bash
+az network nsg create \
+  --name nsg-databricks \
+  --resource-group $RESOURCE_GROUP \
+  --location $LOCATION
+
+az network vnet subnet update \
+  --name snet-databricks-public \
+  --resource-group $RESOURCE_GROUP \
+  --vnet-name $VNET_NAME \
+  --network-security-group nsg-databricks
+
+az network vnet subnet update \
+  --name snet-databricks-private \
+  --resource-group $RESOURCE_GROUP \
+  --vnet-name $VNET_NAME \
+  --network-security-group nsg-databricks
+```
+
+### 1.3 Create VNet-injected Databricks workspace
+
+```bash
+WORKSPACE_NAME="<your-workspace-name>"
+VNET_ID=$(az network vnet show --name $VNET_NAME --resource-group $RESOURCE_GROUP --query id -o tsv)
+
+az databricks workspace create \
+  --name $WORKSPACE_NAME \
+  --resource-group $RESOURCE_GROUP \
+  --location $LOCATION \
+  --sku premium \
+  --public-network-access Enabled \
+  --required-nsg-rules AllRules \
+  --vnet "$VNET_ID" \
+  --public-subnet snet-databricks-public \
+  --private-subnet snet-databricks-private \
+  --enable-no-public-ip
+```
+
+> **`--public-network-access Enabled`** is critical. This creates hybrid mode: internal users use Private Link, Copilot Studio uses IP-restricted public access.
+
+This takes ~4 minutes. Note the workspace URL from the output (e.g. `adb-XXXXXXXXX.X.azuredatabricks.net`).
+
+### 1.4 Create Private DNS zones and link to VNet
+
+```bash
+# DNS zone for workspace
+az network private-dns zone create \
+  --name "privatelink.azuredatabricks.net" \
+  --resource-group $RESOURCE_GROUP
+
+# DNS zone for Databricks Apps
+az network private-dns zone create \
+  --name "privatelink.azure.databricksapps.com" \
+  --resource-group $RESOURCE_GROUP
+
+# Link both to VNet
+az network private-dns link vnet create \
+  --name link-dbx \
+  --resource-group $RESOURCE_GROUP \
+  --zone-name "privatelink.azuredatabricks.net" \
+  --virtual-network $VNET_NAME \
+  --registration-enabled false
+
+az network private-dns link vnet create \
+  --name link-apps \
+  --resource-group $RESOURCE_GROUP \
+  --zone-name "privatelink.azure.databricksapps.com" \
+  --virtual-network $VNET_NAME \
+  --registration-enabled false
+```
+
+### 1.5 Create Private Endpoint
+
+```bash
+WORKSPACE_RESOURCE_ID=$(az databricks workspace show \
+  --name $WORKSPACE_NAME \
+  --resource-group $RESOURCE_GROUP \
+  --query id -o tsv)
+
+az network private-endpoint create \
+  --name pe-databricks-frontend \
+  --resource-group $RESOURCE_GROUP \
+  --location $LOCATION \
+  --vnet-name $VNET_NAME \
+  --subnet snet-private-endpoints \
+  --private-connection-resource-id "$WORKSPACE_RESOURCE_ID" \
+  --group-id "databricks_ui_api" \
+  --connection-name "pe-conn-databricks"
+
+# Auto-register DNS records
+az network private-endpoint dns-zone-group create \
+  --endpoint-name pe-databricks-frontend \
+  --resource-group $RESOURCE_GROUP \
+  --name dbx-dns-group \
+  --zone-name privatelink-azuredatabricks-net \
+  --private-dns-zone "$(az network private-dns zone show \
+    --name privatelink.azuredatabricks.net \
+    --resource-group $RESOURCE_GROUP --query id -o tsv)"
+```
+
+### 1.6 Verify Private Link
+
+```bash
+# Confirm PE is approved
+az databricks workspace show \
+  --name $WORKSPACE_NAME \
+  --resource-group $RESOURCE_GROUP \
+  --query "privateEndpointConnections[].{name:name, status:properties.privateLinkServiceConnectionState.status}" \
+  -o table
+```
+
+Expected output:
+
+```
+Name                         Status
+---------------------------  --------
+pe-conn-databricks           Approved
+```
+
+---
+
+## Part 2 -- Deploy the Databricks App
+
+### 2.1 Authenticate to the workspace
+
+```bash
+WORKSPACE_URL="https://<your-workspace>.azuredatabricks.net"
+databricks auth login --host $WORKSPACE_URL
+```
+
+### 2.2 Update `app.yaml`
 
 ```yaml
 command:
@@ -116,434 +241,232 @@ env:
     value: "INFO"
 ```
 
-Find your Genie Space ID in the URL: `https://<workspace>/genie/rooms/<THIS-IS-THE-ID>?o=...`
-
-### 1.3 Upload the code to the workspace
+### 2.3 Upload and deploy
 
 ```bash
-WS_PATH="/Workspace/Users/<your-email>/genie-mcp-copilot"
+APP_NAME="genie-mcp-copilot"
+WS_PATH="/Workspace/Users/<your-email>/$APP_NAME"
+
 databricks workspace mkdirs "$WS_PATH"
 for f in app.py app.yaml pyproject.toml requirements.txt; do
   databricks workspace import "$WS_PATH/$f" --file "$f" --format AUTO --overwrite
 done
+
+databricks apps create $APP_NAME
+databricks apps deploy $APP_NAME --source-code-path "$WS_PATH"
 ```
 
-### 1.4 Create and deploy the app
+Wait for `app_status.state = RUNNING` (~2-5 minutes):
 
 ```bash
-# Create the app
-databricks apps create <your-app-name>
-
-# Deploy the code
-databricks apps deploy <your-app-name> --source-code-path "$WS_PATH"
+databricks apps get $APP_NAME
 ```
 
-First deployment takes 2-5 minutes. Monitor with:
+### 2.4 Grant the app's SP permissions
+
+Find the SP Application ID from the app details, then:
 
 ```bash
-databricks apps get <your-app-name>
-```
+TOKEN=$(databricks auth token --host $WORKSPACE_URL | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+SP_APP_ID="<sp-application-id-from-app-details>"
 
-The app URL will be:
-
-```
-https://<your-app-name>-<workspace-id>.<N>.azure.databricksapps.com
-```
-
-### 1.5 Grant the app's Service Principal access
-
-Databricks Apps auto-creates a Service Principal. You need to grant it access to the Genie Space and the underlying data.
-
-**Find the SP's Application ID:**
-
-Go to **Compute > Apps > your-app** and note the Service Principal name (e.g. `app-xxxxx your-app-name`). Then find its Application ID (UUID) via:
-
-```bash
-databricks api get /api/2.0/preview/scim/v2/ServicePrincipals \
-  | python3 -c "
-import sys,json
-for sp in json.load(sys.stdin).get('Resources',[]):
-    if 'your-app-name' in sp.get('displayName',''):
-        print('App ID:', sp.get('applicationId'))
-"
-```
-
-**Grant CAN_RUN on the Genie Space** (use the Application ID, not the display name):
-
-```bash
-curl -X PUT "https://<workspace>/api/2.0/permissions/genie/<space-id>" \
-  -H "Authorization: Bearer <token>" \
+# CAN_RUN on Genie space
+curl -X PUT "$WORKSPACE_URL/api/2.0/permissions/genie/<space-id>" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"access_control_list": [
-    {"service_principal_name": "<sp-application-id>", "permission_level": "CAN_RUN"}
-  ]}'
-```
+  -d "{\"access_control_list\": [{\"service_principal_name\": \"$SP_APP_ID\", \"permission_level\": \"CAN_RUN\"}]}"
 
-**Grant CAN_USE on the SQL warehouse:**
-
-```bash
-curl -X PUT "https://<workspace>/api/2.0/permissions/sql/warehouses/<warehouse-id>" \
-  -H "Authorization: Bearer <token>" \
+# CAN_USE on SQL warehouse
+curl -X PUT "$WORKSPACE_URL/api/2.0/permissions/sql/warehouses/<warehouse-id>" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"access_control_list": [
-    {"service_principal_name": "<sp-application-id>", "permission_level": "CAN_USE"}
-  ]}'
+  -d "{\"access_control_list\": [{\"service_principal_name\": \"$SP_APP_ID\", \"permission_level\": \"CAN_USE\"}]}"
 ```
-
-**Grant Unity Catalog table access:**
 
 ```sql
-GRANT USE CATALOG ON CATALOG <your_catalog> TO `<sp-application-id>`;
-GRANT USE SCHEMA ON SCHEMA <your_catalog>.<your_schema> TO `<sp-application-id>`;
-GRANT SELECT ON SCHEMA <your_catalog>.<your_schema> TO `<sp-application-id>`;
+-- Unity Catalog grants (run via SQL editor or API)
+GRANT USE CATALOG ON CATALOG <catalog> TO `<sp-application-id>`;
+GRANT USE SCHEMA ON SCHEMA <catalog>.<schema> TO `<sp-application-id>`;
+GRANT SELECT ON SCHEMA <catalog>.<schema> TO `<sp-application-id>`;
 ```
 
-### 1.6 Verify the MCP endpoint
-
-Test the app directly with `curl`:
+### 2.5 Verify MCP endpoint
 
 ```bash
-# Get a Databricks token
-TOKEN=$(databricks auth token --host https://<your-workspace>.azuredatabricks.net | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+MCP_URL="https://$APP_NAME-<workspace-id>.<N>.azure.databricksapps.com/mcp"
 
-MCP_URL="https://<your-app-name>-<workspace-id>.<N>.azure.databricksapps.com/mcp"
-
-# Initialize an MCP session
 INIT=$(curl -sS -D - -X POST "$MCP_URL" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}')
 
-SESSION_ID=$(echo "$INIT" | grep -i "mcp-session-id" | head -1 | sed 's/.*: *//;s/\r//')
+SESSION=$(echo "$INIT" | grep -i "mcp-session-id" | head -1 | sed 's/.*: *//;s/\r//')
 
-# Query Genie
 curl -sS -X POST "$MCP_URL" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -H "Mcp-Session-Id: $SESSION_ID" \
+  -H "Mcp-Session-Id: $SESSION" \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query_genie","arguments":{"query":"How many customers are there?"}}}'
 ```
 
-You should see a JSON-RPC response with SQL, results, and a conversation ID.
-
 ---
 
-## Part 2 -- Create OAuth App Connection in Databricks
-
-### 2.1 Create the App Connection
+## Part 3 -- Databricks OAuth App Connection
 
 1. Go to [Databricks Account Console](https://accounts.azuredatabricks.net) > **Settings** > **App connections**
 2. Click **Add connection**
-3. Fill in:
-   - **Name**: `copilot-studio-mcp` (or any descriptive name)
-   - **Redirect URLs**: Add both of these:
+3. Configure:
+   - **Name**: `copilot-studio-mcp`
+   - **Redirect URLs** (add both):
      - `https://token.botframework.com/.auth/web/redirect`
-     - `https://global.consent.azure-apim.net/redirect/<your-copilot-redirect-path>` (you'll get this from Copilot Studio later -- see step 3.3)
+     - `https://global.consent.azure-apim.net/redirect/<your-copilot-path>` *(get this from step 4.3)*
    - **Access scopes**: `all-apis offline_access`
-4. Click **Generate a client secret**
-5. **Save the Client ID and Client Secret** -- the secret is only shown once
-
-### 2.2 Identify your OIDC endpoints
-
-Your workspace OIDC endpoints follow this pattern:
-
-| Endpoint | URL |
-|----------|-----|
-| Authorization | `https://<your-workspace>.azuredatabricks.net/oidc/v1/authorize` |
-| Token | `https://<your-workspace>.azuredatabricks.net/oidc/v1/token` |
-| Refresh | `https://<your-workspace>.azuredatabricks.net/oidc/v1/token` |
-| Scopes | `all-apis offline_access` |
+4. **Generate a client secret** -- save the **Client ID** and **Client Secret** (shown only once)
 
 ---
 
-## Part 3 -- Connect to Copilot Studio
+## Part 4 -- Copilot Studio Configuration
 
-### 3.1 Create an agent
+### 4.1 Create an agent
 
 1. Go to [copilotstudio.microsoft.com](https://copilotstudio.microsoft.com)
-2. Click **Create** > **New agent**
-3. Name it (e.g. `Genie Data Assistant`)
-4. Click **Create**
+2. **Create** > **New agent** > name it (e.g. `Genie Data Assistant`)
 
-### 3.2 Configure agent-level authentication
+### 4.2 Configure agent authentication
 
-1. In your agent, click **Settings** (gear icon, top-right) > **Security** > **Authentication**
-2. Select **Authenticate manually**
-3. Toggle **Require users to sign in** to ON
-4. Set **Service provider** to **Generic OAuth 2**
-5. Fill in:
+**Settings** > **Security** > **Authentication** > **Authenticate manually** > **Require users to sign in**: ON
+
+Set **Service provider** to **Generic OAuth 2** and fill in every field:
 
 | Field | Value |
 |-------|-------|
-| **Client ID** | `<client-id from step 2.1>` |
-| **Client secret** | `<client-secret from step 2.1>` |
-| **Scope list delimiter** | ` ` (a single space character) |
-| **Authorization URL template** | `https://<your-workspace>.azuredatabricks.net/oidc/v1/authorize` |
-| **Authorization URL query string template** | `?client_id={ClientId}&response_type=code&redirect_uri={RedirectUrl}&scope={Scopes}` |
-| **Token URL template** | `https://<your-workspace>.azuredatabricks.net/oidc/v1/token` |
-| **Token URL query string template** | *(leave blank)* |
-| **Token body template** | `code={Code}&grant_type=authorization_code&redirect_uri={RedirectUrl}&client_id={ClientId}&client_secret={ClientSecret}` |
-| **Refresh URL template** | `https://<your-workspace>.azuredatabricks.net/oidc/v1/token` |
-| **Refresh URL query string template** | *(leave blank)* |
-| **Refresh body template** | `refresh_token={RefreshToken}&grant_type=refresh_token&client_id={ClientId}&client_secret={ClientSecret}` |
-| **Scopes** | `all-apis offline_access` |
+| Client ID | `<from Part 3>` |
+| Client secret | `<from Part 3>` |
+| Scope list delimiter | ` ` *(single space -- not blank)* |
+| Authorization URL template | `https://<workspace>.azuredatabricks.net/oidc/v1/authorize` |
+| Authorization URL query string template | `?client_id={ClientId}&response_type=code&redirect_uri={RedirectUrl}&scope={Scopes}` |
+| Token URL template | `https://<workspace>.azuredatabricks.net/oidc/v1/token` |
+| Token URL query string template | *(leave blank)* |
+| Token body template | `code={Code}&grant_type=authorization_code&redirect_uri={RedirectUrl}&client_id={ClientId}&client_secret={ClientSecret}` |
+| Refresh URL template | `https://<workspace>.azuredatabricks.net/oidc/v1/token` |
+| Refresh URL query string template | *(leave blank)* |
+| Refresh body template | `refresh_token={RefreshToken}&grant_type=refresh_token&client_id={ClientId}&client_secret={ClientSecret}` |
+| Scopes | `all-apis offline_access` |
 
-6. Click **Save**
+Click **Save**.
 
-> **Important:** Note the **Redirect URL** shown at the top of the Authentication page (e.g. `https://token.botframework.com/.auth/web/redirect`). Make sure this URL is registered in your Databricks OAuth App Connection (step 2.1).
+### 4.3 Add the MCP Server action
 
-### 3.3 Add the MCP Server action
-
-1. In your agent, go to **Actions** (left sidebar) > **Add an action**
-2. Search for or select **Model Context Protocol** (MCP Server)
-3. Fill in:
+**Actions** > **Add an action** > **Model Context Protocol**
 
 | Field | Value |
 |-------|-------|
-| **Server name** | `genie-mcp` (or any name) |
-| **Server description** | `Databricks Genie data analysis` |
-| **Server URL** | `https://<your-app-name>-<workspace-id>.<N>.azure.databricksapps.com/mcp` |
-| **Authentication** | **OAuth 2.0** |
+| Server name | `genie-mcp` |
+| Server description | `Databricks Genie data analysis` |
+| Server URL | `https://<app-name>-<workspace-id>.<N>.azure.databricksapps.com/mcp` |
+| Authentication | **OAuth 2.0** |
 
-4. When OAuth 2.0 is selected, fill in the same OAuth fields:
+Fill in the **same OAuth fields** as step 4.2 (Client ID, Client secret, all URL templates, body templates, scopes).
 
-| Field | Value |
-|-------|-------|
-| **Client ID** | `<client-id from step 2.1>` |
-| **Client secret** | `<client-secret from step 2.1>` |
-| **Scope list delimiter** | ` ` (a single space character) |
-| **Authorization URL template** | `https://<your-workspace>.azuredatabricks.net/oidc/v1/authorize` |
-| **Authorization URL query string template** | `?client_id={ClientId}&response_type=code&redirect_uri={RedirectUrl}&scope={Scopes}` |
-| **Token URL template** | `https://<your-workspace>.azuredatabricks.net/oidc/v1/token` |
-| **Token URL query string template** | *(leave blank)* |
-| **Token body template** | `code={Code}&grant_type=authorization_code&redirect_uri={RedirectUrl}&client_id={ClientId}&client_secret={ClientSecret}` |
-| **Refresh URL template** | `https://<your-workspace>.azuredatabricks.net/oidc/v1/token` |
-| **Refresh URL query string template** | *(leave blank)* |
-| **Refresh body template** | `refresh_token={RefreshToken}&grant_type=refresh_token&client_id={ClientId}&client_secret={ClientSecret}` |
-| **Scopes** | `all-apis offline_access` |
+Click **Create**. Copilot Studio connects to the MCP server and auto-discovers the `query_genie` tool.
 
-5. Click **Create**
-6. Copilot Studio will connect to the MCP server and auto-discover the `query_genie` tool
-7. **Check the redirect URL** shown on this page. If it differs from step 3.2 (e.g. `https://global.consent.azure-apim.net/redirect/...`), go back to the Databricks Account Console and add it to the OAuth App Connection's redirect URLs.
+> **Important:** After creating the action, check the error log or redirect URL. If you see a new redirect URL like `https://global.consent.azure-apim.net/redirect/...`, go back to the Databricks Account Console and add it to the App Connection's redirect URLs.
 
-### 3.4 Test in Copilot Studio
+### 4.4 Test
 
-1. Open the **Test** panel (bottom-left)
-2. The agent should prompt you to **Login** (first time only)
-3. Click **Login** and authenticate with your Databricks/Entra ID credentials
-4. Ask a question: `How many customers are there?`
-5. You should see Copilot Studio call the `query_genie` tool and return a response with SQL and results
-
-### 3.5 Publish to Teams (optional)
-
-1. Go to **Channels** > **Microsoft Teams**
-2. Click **Turn on Teams**
-3. Open the agent in Teams and start chatting
+1. Open the **Test** panel in Copilot Studio
+2. The agent prompts you to **Login** (first time)
+3. Authenticate with your Databricks / Entra ID credentials
+4. Ask: `How many customers are there?`
+5. The agent calls `query_genie` and returns SQL + results
 
 ---
 
-## Part 4 -- Private Link Configuration (Optional)
+## Part 5 -- IP Access Lists (Securing Hybrid Mode)
 
-If your Databricks workspace uses Azure Private Link, Copilot Studio (running in Microsoft's cloud) cannot reach the workspace OIDC endpoints or the app URL by default.
+With Private Link + hybrid mode, the workspace is publicly accessible. To lock it down so only your IPs and Copilot Studio can access it:
 
-### Prerequisites for Private Link
+### 5.1 Important: Test first without IP ACLs
 
-Azure Databricks Private Link requires **VNet injection** -- the workspace must be deployed into a customer-managed VNet. This is a **creation-time setting** and cannot be changed after the workspace is created.
+IP ACLs are the #1 cause of `403 Forbidden` errors from Copilot Studio. Confirm everything works **before** enabling them.
 
-### Azure infrastructure setup
-
-If your workspace is not VNet-injected, you need to create a new one:
+### 5.2 Enable IP access lists
 
 ```bash
-# 1. Create a VNet
-az network vnet create \
-  --name vnet-databricks \
-  --resource-group <your-rg> \
-  --location <your-region> \
-  --address-prefix 10.0.0.0/16 \
-  --subnet-name snet-private-endpoints \
-  --subnet-prefix 10.0.1.0/24
+# Create an allow list with your IP
+curl -X POST "$WORKSPACE_URL/api/2.0/ip-access-lists" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"label": "Admin IPs", "list_type": "ALLOW", "ip_addresses": ["<your-ip>"]}'
 
-# 2. Disable PE network policies on the PE subnet
-az network vnet subnet update \
-  --name snet-private-endpoints \
-  --resource-group <your-rg> \
-  --vnet-name vnet-databricks \
-  --private-endpoint-network-policies Disabled
+# Add Power Platform IPs (required for Copilot Studio)
+# Get current IP ranges for PowerPlatformInfra and PowerPlatformPlex:
+# https://www.microsoft.com/en-us/download/details.aspx?id=56519
+# Add the relevant regional ranges to the allow list.
 
-# 3. Create Databricks subnets (with delegation)
-az network vnet subnet create \
-  --name snet-databricks-public \
-  --resource-group <your-rg> \
-  --vnet-name vnet-databricks \
-  --address-prefix 10.0.2.0/24 \
-  --delegations Microsoft.Databricks/workspaces
-
-az network vnet subnet create \
-  --name snet-databricks-private \
-  --resource-group <your-rg> \
-  --vnet-name vnet-databricks \
-  --address-prefix 10.0.3.0/24 \
-  --delegations Microsoft.Databricks/workspaces
-
-# 4. Create NSG and attach to subnets
-az network nsg create --name nsg-databricks --resource-group <your-rg> --location <your-region>
-az network vnet subnet update --name snet-databricks-public --resource-group <your-rg> --vnet-name vnet-databricks --network-security-group nsg-databricks
-az network vnet subnet update --name snet-databricks-private --resource-group <your-rg> --vnet-name vnet-databricks --network-security-group nsg-databricks
-
-# 5. Create VNet-injected workspace with public access enabled (hybrid mode)
-az databricks workspace create \
-  --name <workspace-name> \
-  --resource-group <your-rg> \
-  --location <your-region> \
-  --sku premium \
-  --public-network-access Enabled \
-  --required-nsg-rules AllRules \
-  --vnet "/subscriptions/<sub-id>/resourceGroups/<your-rg>/providers/Microsoft.Network/virtualNetworks/vnet-databricks" \
-  --public-subnet snet-databricks-public \
-  --private-subnet snet-databricks-private \
-  --enable-no-public-ip
-
-# 6. Create Private DNS zones
-az network private-dns zone create --name "privatelink.azuredatabricks.net" --resource-group <your-rg>
-az network private-dns zone create --name "privatelink.azure.databricksapps.com" --resource-group <your-rg>
-
-# 7. Link DNS zones to VNet
-az network private-dns link vnet create --name link-dbx --resource-group <your-rg> --zone-name "privatelink.azuredatabricks.net" --virtual-network vnet-databricks --registration-enabled false
-az network private-dns link vnet create --name link-apps --resource-group <your-rg> --zone-name "privatelink.azure.databricksapps.com" --virtual-network vnet-databricks --registration-enabled false
-
-# 8. Create Private Endpoint
-az network private-endpoint create \
-  --name pe-databricks-frontend \
-  --resource-group <your-rg> \
-  --location <your-region> \
-  --vnet-name vnet-databricks \
-  --subnet snet-private-endpoints \
-  --private-connection-resource-id "/subscriptions/<sub-id>/resourceGroups/<your-rg>/providers/Microsoft.Databricks/workspaces/<workspace-name>" \
-  --group-id "databricks_ui_api" \
-  --connection-name "pe-conn-databricks"
-
-# 9. Create DNS zone group for automatic records
-az network private-endpoint dns-zone-group create \
-  --endpoint-name pe-databricks-frontend \
-  --resource-group <your-rg> \
-  --name dbx-dns-group \
-  --zone-name privatelink-azuredatabricks-net \
-  --private-dns-zone "/subscriptions/<sub-id>/resourceGroups/<your-rg>/providers/Microsoft.Network/privateDnsZones/privatelink.azuredatabricks.net"
+# Enable IP access lists
+curl -X PATCH "$WORKSPACE_URL/api/2.0/workspace-conf" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"enableIpAccessLists": "true"}'
 ```
 
-### Copilot Studio + Private Link options
+> IP ACLs only apply to **public** traffic. Private Link traffic bypasses them entirely.
 
-Since Copilot Studio runs in Microsoft's cloud, it needs public access to reach the workspace OIDC endpoints and the app URL. Three approaches:
+### 5.3 If Copilot Studio gets 403 after enabling IP ACLs
 
-#### Option A: Hybrid Mode (Recommended)
-
-Keep public network access enabled alongside Private Link. Use IP access lists to restrict public access to Power Platform IPs. **Important:** Copilot Studio IP ranges must be whitelisted, otherwise the OAuth token exchange and MCP calls will get `403 Forbidden`.
-
-1. Enable IP access lists in Databricks: **Settings > Security > IP Access Lists**
-2. Add `PowerPlatformInfra` and `PowerPlatformPlex` Azure service tag IP ranges
-3. Internal users continue using Private Link; only whitelisted Power Platform IPs can access publicly
-
-> **Gotcha we hit:** If IP access lists are enabled but Power Platform IPs are not whitelisted, Copilot Studio gets `403 Forbidden` errors when trying to authenticate or call the MCP endpoint. When testing, disable IP ACLs first, confirm everything works, then add the Power Platform IPs.
-
-#### Option B: Power Platform VNet Integration
-
-Route Copilot Studio traffic through a VNet with a Private Endpoint:
-1. Configure VNet support for the Power Platform environment (requires a Managed Environment)
-2. Copilot Studio agent traffic routes through the VNet's private connection
-
-#### Option C: Azure API Management (APIM) Reverse Proxy
-
-Deploy APIM with a public frontend that proxies to Databricks via Private Endpoint.
-
-| Network Config | Recommended Approach |
-|---|---|
-| Public workspace (default) | No extra config needed |
-| IP ACLs only | Whitelist Power Platform IPs |
-| Private Link (hybrid OK) | **Option A** -- enable public + IP ACLs |
-| Private Link (strict, no public) | **Option B** first, fall back to **Option C** |
-
----
-
-## Local Development
+Temporarily disable to confirm it's an IP issue:
 
 ```bash
-pip install uv
-uv sync
-
-export DATABRICKS_HOST="https://<your-workspace>.azuredatabricks.net"
-export DATABRICKS_CLIENT_ID="<your-sp-client-id>"
-export DATABRICKS_CLIENT_SECRET="<your-sp-client-secret>"
-export GENIE_SPACE_ID="<your-genie-space-id>"
-
-uv run uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+curl -X PATCH "$WORKSPACE_URL/api/2.0/workspace-conf" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"enableIpAccessLists": "false"}'
 ```
 
----
-
-## Environment Variables
-
-| Variable | Source | Description |
-|----------|--------|-------------|
-| `DATABRICKS_HOST` | `app.yaml` | Workspace URL |
-| `DATABRICKS_CLIENT_ID` | Auto-injected | App SP client ID (set automatically by Databricks Apps) |
-| `DATABRICKS_CLIENT_SECRET` | Auto-injected | App SP secret (set automatically by Databricks Apps) |
-| `GENIE_SPACE_ID` | `app.yaml` | Genie Space ID |
-| `MLFLOW_TRACKING_URI` | `app.yaml` | Must be `databricks` (required by `databricks-ai-bridge`) |
-| `LOG_LEVEL` | `app.yaml` | Python log level (default: `INFO`) |
+Then add the missing Power Platform IP ranges and re-enable.
 
 ---
 
 ## Troubleshooting
 
-### App fails to start
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `NonVNetInjectedWorkspaceNotSupported` | Workspace was not created with VNet injection | VNet injection is a creation-time setting. Create a new workspace with `--vnet`, `--public-subnet`, `--private-subnet` flags |
+| `Connector request failed / forbidden` | IP ACLs blocking Copilot Studio | Disable IP ACLs or add Power Platform IPs (see Part 5) |
+| `redirect_uri not registered` | Copilot Studio's redirect URL is not in the Databricks OAuth App Connection | Add the exact URL from the error message to the App Connection's redirect URLs |
+| `PERMISSION_DENIED: Failed to fetch tables` | App SP lacks table access | Grant `USE CATALOG`, `USE SCHEMA`, `SELECT` to the SP's Application ID (UUID) |
+| `Node with resource name ... does not exist` | App SP lacks Genie Space access | Grant `CAN_RUN` on the Genie Space to the SP's Application ID |
+| `Model registry functionality is unavailable` | Missing `MLFLOW_TRACKING_URI` | Add `MLFLOW_TRACKING_URI: databricks` to `app.yaml` and redeploy |
+| Scope delimiter error in Copilot Studio | `all-apis offline_access` has a space | Set **Scope list delimiter** to a single space character, not blank |
+| OAuth login loops | Wrong OIDC URLs | URLs must point to the **workspace** (`*.azuredatabricks.net`), not the app (`*.databricksapps.com`) |
 
-Check logs: **Compute > Apps > your-app > Logs**. Common causes:
-- Missing `GENIE_SPACE_ID` in `app.yaml`
-- Dependency install failure -- check build logs for `uv` errors
-- Port mismatch -- `app.yaml` must use `--port 8000`
+---
 
-### "GENIE_SPACE_ID not configured"
+## Azure Resources Created
 
-Set `GENIE_SPACE_ID` in `app.yaml` and redeploy.
+| Resource | Name | Details |
+|----------|------|---------|
+| VNet | `vnet-databricks` | `10.0.0.0/16` |
+| Subnet | `snet-private-endpoints` | `10.0.1.0/24` -- for Private Endpoints |
+| Subnet | `snet-databricks-public` | `10.0.2.0/24` -- delegated to Databricks |
+| Subnet | `snet-databricks-private` | `10.0.3.0/24` -- delegated to Databricks |
+| NSG | `nsg-databricks` | Attached to Databricks subnets |
+| Private DNS Zone | `privatelink.azuredatabricks.net` | Linked to VNet |
+| Private DNS Zone | `privatelink.azure.databricksapps.com` | Linked to VNet |
+| Databricks Workspace | `<workspace-name>` | VNet-injected, Premium, NPIP, hybrid mode |
+| Private Endpoint | `pe-databricks-frontend` | `databricks_ui_api`, auto-approved |
 
-### "Model registry functionality is unavailable"
+---
 
-`MLFLOW_TRACKING_URI` is not set to `databricks`. Add it to `app.yaml` and redeploy.
+## Files
 
-### "Node with resource name ... does not exist"
-
-The app's SP doesn't have `CAN_RUN` on the Genie Space. Grant it via the permissions API using the SP's **Application ID** (UUID), not its display name.
-
-### "PERMISSION_DENIED: Failed to fetch tables" or "No access to table"
-
-The app's SP needs `USE CATALOG`, `USE SCHEMA`, and `SELECT` on the underlying tables. See Part 1, step 1.5.
-
-### "redirect_uri not registered for OAuth application"
-
-The redirect URL used by Copilot Studio is not in the Databricks OAuth App Connection. Copilot Studio uses **two different redirect URLs**:
-
-1. Agent authentication: `https://token.botframework.com/.auth/web/redirect`
-2. MCP action OAuth: `https://global.consent.azure-apim.net/redirect/<dynamic-path>`
-
-Add **both** to the Databricks Account Console > App connections > Redirect URLs. The MCP action redirect URL appears after you create the action -- check the error message for the exact URL.
-
-### "Connector request failed / HttpStatusCode: forbidden"
-
-This is usually caused by **IP access lists** blocking Copilot Studio's requests. Copilot Studio calls from Microsoft's Power Platform infrastructure IPs, which must be whitelisted. To diagnose:
-
-1. Temporarily disable IP access lists: **Settings > Security > IP Access Lists > Disable**
-2. Test the agent again
-3. If it works, re-enable IP ACLs and add `PowerPlatformInfra` / `PowerPlatformPlex` service tag IPs
-
-### Copilot Studio "Scope list delimiter" error
-
-The scope `all-apis offline_access` contains a space. Set the **Scope list delimiter** to a single space character (` `). Do not leave it blank.
-
-### Copilot Studio OAuth login loops or fails silently
-
-- Verify the Authorization URL, Token URL, and Refresh URL all point to the **workspace URL** (not the app URL)
-- Confirm Client ID and Client Secret match the Databricks Account Console App Connection
-- Check that `all-apis offline_access` is in both the App Connection scopes and the Copilot Studio scopes
+```
+app.py              FastAPI + FastMCP server with OBO token passthrough
+app.yaml            Databricks App config (points to PL workspace)
+pyproject.toml      Python dependencies (managed by uv)
+requirements.txt    Bootstrap dependency (uv) for Databricks Apps
+README.md           This file (Private Link edition)
+```
