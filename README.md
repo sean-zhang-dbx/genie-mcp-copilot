@@ -35,15 +35,23 @@ Databricks Genie Space --> Unity Catalog Tables
 
 ## Prerequisites
 
-- **Azure CLI** -- [Install](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
 - **Databricks CLI** -- [Install](https://docs.databricks.com/dev-tools/cli/install.html)
-- An **Azure subscription** with permissions to create VNets, NSGs, Private Endpoints, DNS zones, and Databricks workspaces
+- A **VNet-injected Databricks workspace** (Azure) with **Private Link** and **public network access enabled** (hybrid mode). If you don't have one, Part 1 walks through creating it (requires **Azure CLI**)
+- A **Genie Space** configured in the workspace
 - **Databricks Account Console** access (to create an OAuth App Connection)
 - **Microsoft Copilot Studio** access ([copilotstudio.microsoft.com](https://copilotstudio.microsoft.com))
 
 ---
 
+## Quick Start
+
+**Already have a VNet-injected workspace with Private Link and `publicNetworkAccess: Enabled`?** Skip to [Part 2 -- Deploy the Databricks App](#part-2----deploy-the-databricks-app). Part 1 is only needed if you're building the Azure infrastructure from scratch.
+
+---
+
 ## Part 1 -- Azure Infrastructure
+
+> **Skip this part** if your workspace is already VNet-injected with Private Link configured and public network access enabled (hybrid mode). Proceed directly to Part 2.
 
 ### 1.1 Create VNet and subnets
 
